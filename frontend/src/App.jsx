@@ -122,7 +122,7 @@ export default function App() {
       formData.append("lon", loc.lon);
       formData.append("master_secret", sharedSecretBase64);
 
-      const res = await fetch("http://localhost:5000/encrypt", {
+      const res = await fetch("https://geo-crypto-project.onrender.com/encrypt", {
         method: "POST",
         body: formData,
       });
@@ -157,7 +157,7 @@ export default function App() {
       formData.append("lon", loc.lon);
       formData.append("master_secret", sharedSecretBase64);
 
-      const res = await fetch("http://localhost:5000/decrypt", {
+      const res = await fetch("https://geo-crypto-project.onrender.com/decrypt", {
         method: "POST",
         body: formData,
       });
