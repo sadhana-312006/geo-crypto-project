@@ -3,22 +3,20 @@ from flask_cors import CORS
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from datetime import datetime, timedelta
-import base64, os, io
+from datetime import datetime
+import base64, os, io, secrets, hashlib, smtplib, math
+from email.message import EmailMessage
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# ================= CONFIG =================
-
-TIME_WINDOW_MINUTES = 60       # ⬅ increased
-LOCATION_TOLERANCE = 0.01     # ⬅ ~1km tolerance
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
 
 # ================= HELPERS =================
-
-def get_time_window(dt):
-    minute_block = (dt.minute // TIME_WINDOW_MINUTES) * TIME_WINDOW_MINUTES
-    return dt.replace(minute=minute_block, second=0, microsecond=0)
 
 def derive_key(shared_secret_b64, lat, lon, time_window):
     secret = base64.b64decode(shared_secret_b64)
@@ -42,8 +40,38 @@ def decrypt_bytes(data, key):
     nonce = data[:12]
     return cipher.decrypt(nonce, data[12:], None)
 
-def close(a, b):
-    return abs(float(a) - float(b)) <= LOCATION_TOLERANCE
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dLat = math.radians(float(lat2) - float(lat1))
+    dLon = math.radians(float(lon2) - float(lon1))
+    a = math.sin(dLat/2)**2 + \
+        math.cos(math.radians(float(lat1))) * \
+        math.cos(math.radians(float(lat2))) * \
+        math.sin(dLon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def send_email(receiver, public_key, override_secret):
+    msg = EmailMessage()
+    msg["Subject"] = "SecureGeoCrypt Session Details"
+    msg["From"] = EMAIL_USER
+    msg["To"] = receiver
+
+    msg.set_content(f"""
+SecureGeoCrypt Session Details
+
+Sender Public Key:
+{public_key}
+
+Override Secret:
+{override_secret}
+
+Use this secret only if time has expired.
+""")
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_USER, EMAIL_PASS)
+        smtp.send_message(msg)
 
 # ================= ROUTES =================
 
@@ -58,17 +86,25 @@ def encrypt_file():
         lat = request.form["lat"]
         lon = request.form["lon"]
         shared_secret = request.form["master_secret"]
+        time_limit = int(request.form["time_limit"])
+        radius = float(request.form["radius"])
+        email = request.form["email"]
+        public_key = request.form["public_key"]
     except:
         return jsonify({"error": "Missing data"}), 400
 
     now = datetime.utcnow()
-    window = get_time_window(now)
 
-    key = derive_key(shared_secret, lat, lon, window)
+    key = derive_key(shared_secret, lat, lon, now)
     encrypted = encrypt_bytes(file.read(), key)
 
-    metadata = f"{lat},{lon},{window.isoformat()}|".encode()
+    override_secret = secrets.token_hex(4)
+    override_hash = hashlib.sha256(override_secret.encode()).hexdigest()
+
+    metadata = f"{lat},{lon},{now.isoformat()},{time_limit},{radius},{override_hash}|".encode()
     final_data = metadata + encrypted
+
+    send_email(email, public_key, override_secret)
 
     return send_file(
         io.BytesIO(final_data),
@@ -83,6 +119,7 @@ def decrypt_file():
         cur_lat = request.form["lat"]
         cur_lon = request.form["lon"]
         shared_secret = request.form["master_secret"]
+        override_secret = request.form.get("override_secret")
     except:
         return jsonify({"error": "Missing data"}), 400
 
@@ -90,26 +127,30 @@ def decrypt_file():
 
     try:
         meta, encrypted = full_data.split(b"|", 1)
-        saved_lat, saved_lon, time_str = meta.decode().split(",")
+        saved_lat, saved_lon, time_str, time_limit, radius, override_hash = meta.decode().split(",")
         saved_time = datetime.fromisoformat(time_str)
     except:
         return jsonify({"error": "Invalid encrypted file"}), 400
 
-    # ---- LOCATION CHECK ----
-    if not close(cur_lat, saved_lat) or not close(cur_lon, saved_lon):
-        return jsonify({"error": "Location mismatch"}), 403
+    distance = haversine(cur_lat, cur_lon, saved_lat, saved_lon)
+    if distance > float(radius):
+        return jsonify({"error": "Outside allowed radius"}), 403
 
-    # ---- TIME CHECK ----
     now = datetime.utcnow()
-    if abs((now - saved_time).total_seconds()) > TIME_WINDOW_MINUTES * 60:
-        return jsonify({"error": "Time window expired"}), 403
+    expired = abs((now - saved_time).total_seconds()) > int(time_limit) * 60
 
-    # ---- KEY CHECK ----
+    if expired:
+        if not override_secret:
+            return jsonify({"error": "Time expired. Enter override secret."}), 403
+        if hashlib.sha256(override_secret.encode()).hexdigest() != override_hash:
+            return jsonify({"error": "Invalid override secret"}), 403
+
+    key = derive_key(shared_secret, saved_lat, saved_lon, saved_time)
+
     try:
-        key = derive_key(shared_secret, saved_lat, saved_lon, saved_time)
         decrypted = decrypt_bytes(encrypted, key)
-    except Exception as e:
-        return jsonify({"error": "Key mismatch (DH secret incorrect)"}), 403
+    except:
+        return jsonify({"error": "Key mismatch"}), 403
 
     return send_file(
         io.BytesIO(decrypted),
