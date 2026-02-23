@@ -51,23 +51,12 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
 
-def send_email(receiver, public_key, override_secret):
+def send_email(receiver, subject, content):
     msg = EmailMessage()
-    msg["Subject"] = "SecureGeoCrypt Session Details"
+    msg["Subject"] = subject
     msg["From"] = EMAIL_USER
     msg["To"] = receiver
-
-    msg.set_content(f"""
-SecureGeoCrypt Session Details
-
-Sender Public Key:
-{public_key}
-
-Override Secret:
-{override_secret}
-
-Use this secret only if time has expired.
-""")
+    msg.set_content(content)
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_USER, EMAIL_PASS)
@@ -79,6 +68,24 @@ Use this secret only if time has expired.
 def home():
     return "Backend running"
 
+# 🔑 SEND PUBLIC KEY EARLY
+@app.route("/send-key", methods=["POST"])
+def send_key():
+    email = request.form.get("email")
+    public_key = request.form.get("public_key")
+
+    if not email or not public_key:
+        return jsonify({"error": "Missing email or public key"}), 400
+
+    send_email(
+        email,
+        "SecureGeoCrypt - Public Key",
+        f"Sender Public Key:\n\n{public_key}"
+    )
+
+    return jsonify({"message": "Public key sent successfully"})
+
+# 🔐 ENCRYPT
 @app.route("/encrypt", methods=["POST"])
 def encrypt_file():
     try:
@@ -89,12 +96,10 @@ def encrypt_file():
         time_limit = int(request.form["time_limit"])
         radius = float(request.form["radius"])
         email = request.form["email"]
-        public_key = request.form["public_key"]
     except:
-        return jsonify({"error": "Missing data"}), 400
+        return jsonify({"error": "Missing required encryption data"}), 400
 
     now = datetime.utcnow()
-
     key = derive_key(shared_secret, lat, lon, now)
     encrypted = encrypt_bytes(file.read(), key)
 
@@ -104,7 +109,11 @@ def encrypt_file():
     metadata = f"{lat},{lon},{now.isoformat()},{time_limit},{radius},{override_hash}|".encode()
     final_data = metadata + encrypted
 
-    send_email(email, public_key, override_secret)
+    send_email(
+        email,
+        "SecureGeoCrypt - Override Secret",
+        f"Override Secret (use only if time expired):\n\n{override_secret}"
+    )
 
     return send_file(
         io.BytesIO(final_data),
@@ -112,6 +121,7 @@ def encrypt_file():
         download_name=file.filename + ".enc"
     )
 
+# 🔓 DECRYPT
 @app.route("/decrypt", methods=["POST"])
 def decrypt_file():
     try:
@@ -121,7 +131,7 @@ def decrypt_file():
         shared_secret = request.form["master_secret"]
         override_secret = request.form.get("override_secret")
     except:
-        return jsonify({"error": "Missing data"}), 400
+        return jsonify({"error": "Missing required decryption data"}), 400
 
     full_data = file.read()
 
@@ -130,27 +140,30 @@ def decrypt_file():
         saved_lat, saved_lon, time_str, time_limit, radius, override_hash = meta.decode().split(",")
         saved_time = datetime.fromisoformat(time_str)
     except:
-        return jsonify({"error": "Invalid encrypted file"}), 400
+        return jsonify({"error": "Invalid encrypted file format"}), 400
 
-    distance = haversine(cur_lat, cur_lon, saved_lat, saved_lon)
-    if distance > float(radius):
-        return jsonify({"error": "Outside allowed radius"}), 403
+    # LOCATION CHECK
+    if float(radius) != 0:
+        distance = haversine(cur_lat, cur_lon, saved_lat, saved_lon)
+        if distance > float(radius):
+            return jsonify({"error": "Access denied: Outside allowed radius"}), 403
 
+    # TIME CHECK
     now = datetime.utcnow()
     expired = abs((now - saved_time).total_seconds()) > int(time_limit) * 60
 
     if expired:
         if not override_secret:
-            return jsonify({"error": "Time expired. Enter override secret."}), 403
+            return jsonify({"error": "Time expired: Enter override secret"}), 403
         if hashlib.sha256(override_secret.encode()).hexdigest() != override_hash:
             return jsonify({"error": "Invalid override secret"}), 403
 
-    key = derive_key(shared_secret, saved_lat, saved_lon, saved_time)
-
+    # KEY CHECK
     try:
+        key = derive_key(shared_secret, saved_lat, saved_lon, saved_time)
         decrypted = decrypt_bytes(encrypted, key)
     except:
-        return jsonify({"error": "Key mismatch"}), 403
+        return jsonify({"error": "Key mismatch: Incorrect shared secret"}), 403
 
     return send_file(
         io.BytesIO(decrypted),
